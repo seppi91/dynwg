@@ -10,7 +10,7 @@ setup(
     author='Richard Neumann',
     author_email='mail@richard-neumann.de',
     python_requires='>=3.8',
-    py_modules=['dynwg'],
+    py_modules=['dynwg','wgconfig'],
     scripts=['dynwg'],
     data_files=[
         ('/usr/lib/systemd/system', ['dynwg.service', 'dynwg.timer'])

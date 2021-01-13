@@ -1,8 +1,9 @@
+#! /usr/bin/env python3
 """WireGuard over systemd-networkd DynDNS watchdog daemon."""
 
 from __future__ import annotations
 from argparse import ArgumentParser, Namespace
-from configparser import ConfigParser
+from wgconfig import WGConfig
 from json import dump, load
 from logging import DEBUG, INFO, basicConfig, getLogger
 from os import linesep
@@ -10,13 +11,13 @@ from pathlib import Path
 from socket import gaierror, gethostbyname
 from subprocess import DEVNULL, CalledProcessError, check_call
 from typing import Generator, NamedTuple
+from collections import OrderedDict
 
 
 __all__ = [
     'CACHE',
     'NotAWireGuardDevice',
     'NotAWireGuardClient',
-    'get_networks',
     'main',
     'Cache',
     'WireGuardClient'
@@ -24,7 +25,7 @@ __all__ = [
 
 
 CACHE = Path('/var/cache/dynwg.json')
-SYSTEMD_NETWORK = Path('/etc/systemd/network')
+WIREGUARD_CONFIG = Path('/etc/wireguard/')
 PING = '/usr/bin/ping'
 WG = '/usr/bin/wg'
 LOGGER = getLogger(__file__)
@@ -39,21 +40,21 @@ class NotAWireGuardClient(Exception):
     """Indicates that the device is not a WireGuard client configuration."""
 
 
-def get_networks(interface: str) -> Generator[ConfigParser, None, None]:
-    """Returns the network configuration for the respective interface."""
+# def get_networks(interface: str) -> Generator[ConfigParser, None, None]:
+#     """Returns the network configuration for the respective interface."""
 
-    for path in SYSTEMD_NETWORK.glob('*.network'):
-        network = ConfigParser(strict=False)
+#     for path in WIREGUARD_CONFIG.glob('*.conf'):
+#         network = WGConfig(path, keyattr="Endpoint")
 
-        if not network.read(path):
-            LOGGER.warning('Could not read *.network file: %s', path)
-            continue
+#         # if not network.read(path):
+#         #     LOGGER.warning('Could not read *.conf file: %s', path)
+#         #     continue
 
-        try:
-            if network['Match']['Name'] == interface:
-                yield network
-        except KeyError:
-            LOGGER.warning('Network has no Name: %s', path)
+#         try:
+#             if network['Match']['Name'] == interface:
+#                 yield network
+#         except KeyError:
+#             LOGGER.warning('Network has no Name: %s', path)
 
 
 def get_args() -> Namespace:
@@ -76,7 +77,7 @@ def main():
 
     with Cache(CACHE) as cache:
         for wire_guard_client in WireGuardClient.all():
-            LOGGER.info('Checking: %s.', wire_guard_client.interface)
+            LOGGER.info('Checking: %s.', wire_guard_client.endpoint)
             wire_guard_client.check(cache, check_gateway=args.check_gateway)
 
 
@@ -141,7 +142,6 @@ class Cache(dict):
 
             self.synced = True
 
-
 class WireGuardClient(NamedTuple):
     """Relevant WireGuard configuration settings."""
 
@@ -151,48 +151,55 @@ class WireGuardClient(NamedTuple):
     gateway: str
 
     @classmethod
-    def from_netdev(cls, netdev: ConfigParser) -> WireGuardClient:
-        """Creates a config tuple from the respective netdev data."""
-        if netdev['NetDev']['Kind'] != 'wireguard':
-            raise NotAWireGuardDevice()
-
+    def from_peerConfig(cls, peerConfig, interface: str, gateway: str = None) -> WireGuardClient:
         try:
-            endpoint = netdev['WireGuardPeer']['Endpoint']
-            pubkey = netdev['WireGuardPeer']['PublicKey']
+            endpoint = peerConfig['Endpoint']
+            pubkey = peerConfig['PublicKey']
         except KeyError:
             raise NotAWireGuardClient() from None
+        return cls(interface, pubkey, endpoint, gateway)
 
-        interface = netdev['NetDev']['Name']
+    @classmethod
+    def from_config(cls, config: WGConfig) -> Generator[WireGuardClient, None, None]:
+        """Creates a config tuple from the respective netdev data."""
+
+        interface = config.filename.stem
         gateway = None
 
-        for network in get_networks(interface):
-            try:
-                gateway = network['Route']['Gateway']
-            except KeyError:
-                continue
+        for peer in config.peers.values():
+            yield cls.from_peerConfig(peer, interface)
 
-            break   # Use first available gateway.
+        # for network in get_networks(interface):
+        #     try:
+        #         gateway = network['Route']['Gateway']
+        #     except KeyError:
+        #         continue
 
-        return cls(interface, pubkey, endpoint, gateway)
+        #     break   # Use first available gateway.
+        
 
     @classmethod
     def all(cls) -> Generator[WireGuardClient, None, None]:
         """Yields all available configurations."""
-        for path in SYSTEMD_NETWORK.glob('*.netdev'):
-            netdev = ConfigParser(strict=False)
+        for path in WIREGUARD_CONFIG.glob('*.conf'):
+            config = WGConfig(path, keyattr="Endpoint")
 
-            if not netdev.read(path):
-                LOGGER.warning('Could not read *.netdev file: %s', path)
+            try:
+                config.read_file()
+            except:
+                LOGGER.warning('Could not read *.conf file: %s', path)
                 continue
 
             try:
-                yield cls.from_netdev(netdev)
+                yield from cls.from_config(config)
             except KeyError:
-                LOGGER.warning('Invalid netdev configuration: %s', path)
+                LOGGER.warning('Invalid wireguard configuration: %s', path)
             except NotAWireGuardDevice:
                 LOGGER.debug('Not a WireGuard device: %s', path)
             except NotAWireGuardClient:
                 LOGGER.debug('Not a WireGuard client: %s', path)
+            except EndpointNotSpecified:
+                LOGGER.debug('Endpoint not specified.')
 
     @property
     def hostname(self) -> str:
@@ -240,7 +247,7 @@ class WireGuardClient(NamedTuple):
         if cache.ip_changed(self.hostname):
             return self.reset()
 
-        if check_gateway and self.gateway_unreachable:
-            return self.reset()
+        # if check_gateway and self.gateway_unreachable:
+        #     return self.reset()
 
         return True
